@@ -95,6 +95,7 @@ pub fn run_app(
         theme,
         theme_cycle,
         theme_cycle_idx: 0,
+        wrap_lines: false,
     };
 
     // Run the main loop

@@ -2,7 +2,7 @@ use ratatui::{
     prelude::*,
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
 };
 use std::collections::{HashMap, HashSet};
@@ -345,6 +345,9 @@ pub fn render_rebase_ui(f: &mut Frame, app: &App, area: Rect) {
 
                 let mut change_paragraph =
                     Paragraph::new(Text::from(content_text)).block(change_block_widget);
+                if app.wrap_lines {
+                    change_paragraph = change_paragraph.wrap(Wrap { trim: false });
+                }
 
                 match current_change.state {
                     ChangeState::Accepted => {
@@ -369,13 +372,16 @@ pub fn render_rebase_ui(f: &mut Frame, app: &App, area: Rect) {
                     )));
                 }
 
-                let context_block = Paragraph::new(Text::from(context_lines)).block(
+                let mut context_block = Paragraph::new(Text::from(context_lines)).block(
                     Block::default()
                         .title(Span::styled(" Context ", Style::default().fg(t.fg_dim)))
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(t.border_dim)),
                 );
+                if app.wrap_lines {
+                    context_block = context_block.wrap(Wrap { trim: false });
+                }
                 f.render_widget(context_block, rebase_chunks[2]);
             }
         } else {

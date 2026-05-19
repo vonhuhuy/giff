@@ -77,6 +77,7 @@ giff --auto-rebase          # auto-rebase if behind upstream
 | `Tab` | Toggle focus between file list and diff |
 | `h` / `l` | Focus file list / diff content |
 | `u` | Toggle unified / side-by-side view |
+| `z` | Toggle soft line-wrap |
 | `t` | Toggle dark / light theme |
 | `r` | Enter rebase mode |
 | `?` | Show help |
