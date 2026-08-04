@@ -47,6 +47,7 @@ pub struct App<'a> {
     pub theme: Theme,
     pub theme_cycle: Vec<Theme>,
     pub theme_cycle_idx: usize,
+    pub wrap_lines: bool,
 }
 
 pub enum Pane {

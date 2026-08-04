@@ -4,7 +4,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState,
+        ScrollbarOrientation, ScrollbarState, Wrap,
     },
     Frame,
 };
@@ -227,6 +227,7 @@ fn render_diff_pane(
     is_focused: bool,
     area: Rect,
     theme: &Theme,
+    wrap: bool,
 ) {
     let border_color = if is_focused {
         theme.border_focused
@@ -246,7 +247,9 @@ fn render_diff_pane(
     let content = Text::from(highlighted);
     let visible_height = area.height.saturating_sub(2) as usize;
 
-    let title_text = if total_lines > visible_height {
+    let title_text = if wrap {
+        format!(" {} [wrap] ", title)
+    } else if total_lines > visible_height {
         let max_scroll = total_lines.saturating_sub(visible_height);
         let pos = scroll.min(max_scroll);
         let pct = if max_scroll > 0 {
@@ -267,11 +270,14 @@ fn render_diff_pane(
 
     // ratatui Paragraph::scroll() accepts (u16, u16); clamp for content >65k lines.
     let scroll_u16 = scroll.min(u16::MAX as usize) as u16;
-    let paragraph = Paragraph::new(content).block(block).scroll((scroll_u16, 0));
+    let mut paragraph = Paragraph::new(content).block(block).scroll((scroll_u16, 0));
+    if wrap {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
     f.render_widget(paragraph, area);
 
     // Scrollbar
-    if total_lines > visible_height {
+    if !wrap && total_lines > visible_height {
         let scrollbar_area = Rect::new(
             area.x,
             area.y + 1,
@@ -428,26 +434,221 @@ fn render_side_by_side(f: &mut Frame, app: &App, base_area: Rect, head_area: Rec
 
     let (aligned_base, aligned_head) = align_lines(base_lines, head_lines);
 
-    render_diff_pane(
+    if app.wrap_lines {
+        render_wrapped_side_by_side(
+            f,
+            app,
+            &aligned_base,
+            &aligned_head,
+            current_file,
+            scroll,
+            is_focused,
+            base_area,
+            head_area,
+        );
+    } else {
+        render_diff_pane(
+            f,
+            app.left_label,
+            &aligned_base,
+            current_file,
+            scroll,
+            is_focused,
+            base_area,
+            &app.theme,
+            false,
+        );
+        render_diff_pane(
+            f,
+            app.right_label,
+            &aligned_head,
+            current_file,
+            scroll,
+            is_focused,
+            head_area,
+            &app.theme,
+            false,
+        );
+    }
+}
+
+/// Character-wrap one styled `Line` into one or more rows that each fit within
+/// `width` display columns. Continuation rows start at column 0. Span styles
+/// are preserved across splits. Returns at least one row (an empty row for an
+/// empty input).
+fn wrap_line_to_rows(line: &Line, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::from(Span::raw(""))];
+    }
+
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut current_width: usize = 0;
+
+    for span in line.spans.iter() {
+        let style = span.style;
+        let mut text: &str = span.content.as_ref();
+        while !text.is_empty() {
+            let available = width.saturating_sub(current_width);
+
+            // Take the longest prefix of `text` that fits in `available` cols.
+            let mut taken_bytes = 0usize;
+            let mut taken_width = 0usize;
+            for (idx, ch) in text.char_indices() {
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if taken_width + ch_width > available {
+                    break;
+                }
+                taken_width += ch_width;
+                taken_bytes = idx + ch.len_utf8();
+            }
+
+            if taken_bytes > 0 {
+                let chunk = text[..taken_bytes].to_owned();
+                rows.last_mut().unwrap().push(Span::styled(chunk, style));
+                current_width += taken_width;
+                text = &text[taken_bytes..];
+            }
+
+            if !text.is_empty() {
+                if current_width == 0 {
+                    // First char of `text` is wider than the whole row (or
+                    // zero-width and we haven't advanced). Drop it to avoid
+                    // an infinite loop.
+                    if let Some(ch) = text.chars().next() {
+                        text = &text[ch.len_utf8()..];
+                    }
+                    continue;
+                }
+                rows.push(Vec::new());
+                current_width = 0;
+            }
+        }
+    }
+
+    rows.into_iter().map(Line::from).collect()
+}
+
+/// Render side-by-side with soft-wrap. Both sides are wrapped to their pane
+/// width, then each aligned pair is padded so it occupies the same number of
+/// visual rows on both sides — that keeps subsequent rows in lockstep so a
+/// long wrapped line on one side never shifts the other side downward.
+#[allow(clippy::too_many_arguments)]
+fn render_wrapped_side_by_side(
+    f: &mut Frame,
+    app: &App,
+    base_lines: &[LineChange],
+    head_lines: &[LineChange],
+    current_file: &str,
+    scroll: usize,
+    is_focused: bool,
+    base_area: Rect,
+    head_area: Rect,
+) {
+    let highlighted_base = highlight_line_changes(base_lines, current_file, &app.theme);
+    let highlighted_head = highlight_line_changes(head_lines, current_file, &app.theme);
+
+    let base_inner = base_area.width.saturating_sub(2) as usize;
+    let head_inner = head_area.width.saturating_sub(2) as usize;
+
+    let mut padded_base: Vec<Line<'static>> = Vec::new();
+    let mut padded_head: Vec<Line<'static>> = Vec::new();
+
+    for (b, h) in highlighted_base.iter().zip(highlighted_head.iter()) {
+        let bw = wrap_line_to_rows(b, base_inner);
+        let hw = wrap_line_to_rows(h, head_inner);
+        let max_rows = bw.len().max(hw.len());
+        for i in 0..max_rows {
+            padded_base.push(
+                bw.get(i)
+                    .cloned()
+                    .unwrap_or_else(|| Line::from(Span::raw(""))),
+            );
+            padded_head.push(
+                hw.get(i)
+                    .cloned()
+                    .unwrap_or_else(|| Line::from(Span::raw(""))),
+            );
+        }
+    }
+
+    render_prewrapped_pane(
         f,
         app.left_label,
-        &aligned_base,
-        current_file,
+        padded_base,
         scroll,
         is_focused,
         base_area,
         &app.theme,
     );
-    render_diff_pane(
+    render_prewrapped_pane(
         f,
         app.right_label,
-        &aligned_head,
-        current_file,
+        padded_head,
         scroll,
         is_focused,
         head_area,
         &app.theme,
     );
+}
+
+/// Render a pane from already-wrapped Lines (one Line per visual row).
+/// Differs from `render_diff_pane` in that it skips ratatui's wrap (content is
+/// pre-wrapped) and always shows the `[wrap]` badge in the title.
+fn render_prewrapped_pane(
+    f: &mut Frame,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    scroll: usize,
+    is_focused: bool,
+    area: Rect,
+    theme: &Theme,
+) {
+    let border_color = if is_focused {
+        theme.border_focused
+    } else {
+        theme.border_dim
+    };
+    let title_style = if is_focused {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg_dim)
+    };
+
+    let total_lines = lines.len();
+    let content = Text::from(lines);
+    let visible_height = area.height.saturating_sub(2) as usize;
+
+    let title_text = format!(" {} [wrap] ", title);
+
+    let block = Block::default()
+        .title(Span::styled(title_text, title_style))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let scroll_u16 = scroll.min(u16::MAX as usize) as u16;
+    let paragraph = Paragraph::new(content).block(block).scroll((scroll_u16, 0));
+    f.render_widget(paragraph, area);
+
+    if total_lines > visible_height {
+        let scrollbar_area = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2),
+        );
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll.min(max_scroll));
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            scrollbar_area,
+            &mut scrollbar_state,
+        );
+    }
 }
 
 /// Build unified diff lines by walking both lists in order.
@@ -516,6 +717,7 @@ fn render_unified_diff(f: &mut Frame, app: &App, area: Rect) {
         is_focused,
         area,
         &app.theme,
+        app.wrap_lines,
     );
 }
 
@@ -671,6 +873,7 @@ fn render_help_modal(f: &mut Frame, app: &App, area: Rect) {
             row("n", "Next file with changes"),
             row("p", "Previous file with changes"),
             row("c", "Commit accepted changes"),
+            row("z", "Toggle soft line-wrap"),
             row("Esc", "Back to diff mode"),
             sep(inner_width),
             empty(),
@@ -687,6 +890,7 @@ fn render_help_modal(f: &mut Frame, app: &App, area: Rect) {
             row("h / \u{2190}", "Focus file list"),
             row("l / \u{2192}", "Focus diff content"),
             row("u", "Toggle unified / side-by-side"),
+            row("z", "Toggle soft line-wrap"),
             row("t", "Toggle dark / light theme"),
             row("r", "Enter rebase mode"),
             sep(inner_width),
@@ -754,8 +958,8 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
             ("Tab", "Focus"),
             ("h/l", "Panes"),
             ("u", "View"),
+            ("z", "Wrap"),
             ("t", "Theme"),
-            ("PgUp/Dn", "Page"),
             ("r", "Rebase"),
             ("?", "Help"),
         ],
@@ -766,6 +970,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
             ("x", "Reject"),
             ("n/p", "Files"),
             ("c", "Commit"),
+            ("z", "Wrap"),
             ("?", "Help"),
         ],
     };
@@ -790,6 +995,13 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn clamp_scroll(app: &mut App, content_area_height: u16) {
+    // Under soft-wrap, scroll is measured in visual rows (post-wrap), not
+    // logical lines, so the logical line counts are an under-estimate and
+    // would over-clamp. Let Paragraph cap the offset naturally instead.
+    if app.wrap_lines {
+        return;
+    }
+
     let file = match app.file_names.get(app.current_file_idx) {
         Some(f) => f,
         None => return,
@@ -873,6 +1085,75 @@ fn truncate_path(path: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── wrap_line_to_rows ───────────────────────────────────────────────
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrap_short_line_returns_single_row() {
+        let line = Line::from("hello");
+        let rows = wrap_line_to_rows(&line, 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(line_text(&rows[0]), "hello");
+    }
+
+    #[test]
+    fn wrap_empty_line_returns_single_empty_row() {
+        let line = Line::from(Span::raw(""));
+        let rows = wrap_line_to_rows(&line, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(line_text(&rows[0]), "");
+    }
+
+    #[test]
+    fn wrap_splits_long_line_at_width() {
+        let line = Line::from("abcdefghij");
+        let rows = wrap_line_to_rows(&line, 4);
+        // 10 chars / 4 wide → 3 rows ("abcd","efgh","ij")
+        assert_eq!(rows.len(), 3);
+        assert_eq!(line_text(&rows[0]), "abcd");
+        assert_eq!(line_text(&rows[1]), "efgh");
+        assert_eq!(line_text(&rows[2]), "ij");
+    }
+
+    #[test]
+    fn wrap_preserves_span_styles_across_split() {
+        let red = Style::default().fg(ratatui::style::Color::Red);
+        let blue = Style::default().fg(ratatui::style::Color::Blue);
+        let line = Line::from(vec![Span::styled("aaa", red), Span::styled("bbb", blue)]);
+        let rows = wrap_line_to_rows(&line, 4);
+        // Row 1: "aaa" (red) + "b" (blue), Row 2: "bb" (blue)
+        assert_eq!(rows.len(), 2);
+        assert_eq!(line_text(&rows[0]), "aaab");
+        assert_eq!(rows[0].spans[0].style, red);
+        assert_eq!(rows[0].spans[1].style, blue);
+        assert_eq!(line_text(&rows[1]), "bb");
+        assert_eq!(rows[1].spans[0].style, blue);
+    }
+
+    #[test]
+    fn wrap_zero_width_returns_one_empty_row() {
+        let line = Line::from("anything");
+        let rows = wrap_line_to_rows(&line, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(line_text(&rows[0]), "");
+    }
+
+    #[test]
+    fn wrap_cjk_double_width_chars() {
+        // Each CJK char is 2 display columns. With width=4: row 1 fits 2 CJK
+        // chars (4 cols); row 2 fits 1 CJK + 2 ASCII (4 cols); row 3 has the
+        // tail. Greedy fit, not balanced.
+        let line = Line::from("日本語ABC");
+        let rows = wrap_line_to_rows(&line, 4);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(line_text(&rows[0]), "日本");
+        assert_eq!(line_text(&rows[1]), "語AB");
+        assert_eq!(line_text(&rows[2]), "C");
+    }
 
     #[test]
     fn test_truncate_path_no_truncation_needed() {

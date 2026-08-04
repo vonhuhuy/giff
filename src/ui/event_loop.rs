@@ -381,6 +381,20 @@ where
                                 navigate_rebase_file(&mut app, false);
                             }
                         }
+                        KeyCode::Char('z') => {
+                            app.wrap_lines = !app.wrap_lines;
+                            for v in app.scroll_positions.values_mut() {
+                                *v = 0;
+                            }
+                            app.status_message = Some(
+                                if app.wrap_lines {
+                                    "Soft wrap: on"
+                                } else {
+                                    "Soft wrap: off"
+                                }
+                                .to_string(),
+                            );
+                        }
                         KeyCode::Char('?') => {
                             app.show_help_modal = true;
                         }
@@ -502,6 +516,7 @@ mod tests {
             theme: Theme::dark(),
             theme_cycle: vec![Theme::dark(), Theme::light()],
             theme_cycle_idx: 0,
+            wrap_lines: false,
         }
     }
 
